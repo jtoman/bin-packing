@@ -5,8 +5,6 @@ import java.util.BitSet
 import kotlin.math.max
 import kotlin.math.pow
 
-var numCompletions = 0
-
 data class BinItem(
     val label: String,
     val sz: Int
@@ -247,7 +245,6 @@ fun searchTree(
     currWaste: Int
 ) : Boolean {
     if(currElem == nElems) {
-        numCompletions++
         println("Found new solution: ${searchStack.size} vs ${g.best}")
         check(assigned.cardinality() == nElems)
         return if(searchStack.size < g.best) {
