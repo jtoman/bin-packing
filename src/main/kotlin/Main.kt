@@ -4,6 +4,7 @@ import java.lang.IllegalStateException
 import java.util.BitSet
 import kotlin.math.max
 import kotlin.math.pow
+import kotlin.streams.toList
 
 data class BinItem(
     val label: String,
@@ -55,6 +56,7 @@ class Bin {
 
     fun add(it: BinItem) {
         this.sz += it.sz
+
         var toAddInd = -1
         for(i in elems.withIndex()) {
             if(i.value.sz < it.sz) {
@@ -93,11 +95,19 @@ class Bin {
     }
 }
 
+data class ProposedPacking(
+    val waste: Int,
+    val sz: Int,
+    val membership: BitSet
+)
+
 data class SearchParams(
     val c: Int,
     val sumS : Int,
     val lowerBound: Int,
-    val S: List<BinItem>
+    val S: List<BinItem>,
+    val enumerationStrategy: SubsetEnumerationStrategy,
+    val iterationStrategy: SearchParams.(Sequence<ProposedPacking>) -> Sequence<ProposedPacking>
 ) {
     val minSize : Int get() = S.last().sz
     val nElems : Int get() = S.size
@@ -112,23 +122,24 @@ class GlobalObjective(
     val W get() = ((best - 1) * c) - sumS
 }
 
-suspend fun SequenceScope<List<Int>>.feasible(
+suspend fun SequenceScope<ProposedPacking>.feasible(
     params: SearchParams,
     assigned: BitSet,
     nextItem: Int,
     I: BitSet,
     excl: MutableSet<Int>,
 
+    completionSize: Int,
     l : Int,
     u : Int,
-    testAndYield: suspend SequenceScope<List<Int>>.(BitSet, Set<Int>) -> Unit,
+    testAndYield: suspend SequenceScope<ProposedPacking>.(Int, BitSet, Set<Int>) -> Unit,
 ) {
     var xInd = nextItem
     if(u == 0 || params.minSize > u) {
         if(l > 0) {
             return
         }
-        testAndYield(I, excl)
+        testAndYield(completionSize, I, excl)
         return
     }
     while(xInd < params.nElems && (assigned.get(xInd) || params.S[xInd].sz > u)) {
@@ -138,7 +149,7 @@ suspend fun SequenceScope<List<Int>>.feasible(
         if(l > 0) {
             return
         }
-        testAndYield(I, excl)
+        testAndYield(completionSize, I, excl)
         return
     }
     val currBinSize = params.S[xInd].sz
@@ -146,13 +157,13 @@ suspend fun SequenceScope<List<Int>>.feasible(
     // inclusion
     I.set(xInd)
     feasible(
-        params, assigned, xInd + 1, I, excl, l - currBinSize, u - currBinSize, testAndYield
+        params, assigned, xInd + 1, I, excl, completionSize + currBinSize, l - currBinSize, u - currBinSize, testAndYield
     )
     I.clear(xInd)
 
     excl.add(currBinSize)
     feasible(
-        params, assigned, xInd + 1, I, excl, maxOf(l, currBinSize + 1), u, testAndYield
+        params, assigned, xInd + 1, I, excl, completionSize, maxOf(l, currBinSize + 1), u, testAndYield
     )
     excl.remove(currBinSize)
 }
@@ -163,11 +174,12 @@ suspend fun SequenceScope<Int>.subsetSums(
     params: SearchParams,
     assigned: BitSet,
     i: Int,
-    currSum: Int
+    currSum: Int,
+    pred: (Int) -> Boolean
 ) {
     val tgt = assigned.nextSetBit(i)
     if(tgt == -1) {
-        if(currSum != 0) {
+        if(currSum != 0 && pred(currSum)) {
             yield(currSum)
         }
         return
@@ -180,22 +192,104 @@ suspend fun SequenceScope<Int>.subsetSums(
     )
 }
 
-fun <T> BitSet.mapSet(f: (Int) -> T) : List<T> {
-    val toRet = mutableListOf<T>()
-    var next = this.nextSetBit(0)
-    while(next != -1) {
-        toRet.add(f(next))
-        next = this.nextSetBit(next + 1)
+suspend fun SequenceScope<Int>.subsetSums(
+    params: SearchParams,
+    assigned: BitSet,
+    i: Int,
+    currSum: Int
+) {
+    return subsetSums(params, assigned, i, currSum) { _ -> true }
+}
+
+suspend fun SequenceScope<Int>.subsetSums(
+    params: SearchParams,
+    assigned: BitSet,
+    i: Int,
+    currSum: Int,
+    bound: Int
+) {
+    return subsetSums(params, assigned, i, currSum) { sum ->
+        sum <= bound
     }
-    return toRet
+}
+
+fun interface ExclusionDominationTest {
+    fun test(x: Int): Boolean
+}
+
+interface SubsetEnumerationStrategy {
+    context(SearchParams)
+    fun prepare(
+        I: BitSet,
+        exclusionDiffLB: Int
+    ): ExclusionDominationTest
+}
+
+object UpfrontEnumeration : SubsetEnumerationStrategy {
+    context(SearchParams) override fun prepare(I: BitSet, exclusionDiffLB: Int): ExclusionDominationTest {
+        val subsetSums = sequence<Int> {
+            subsetSums(params, assigned = I, currSum = 0, i = 0)
+        }.toList()
+        return ExclusionDominationTest { x : Int ->
+            subsetSums.all { s ->
+                (x - s > exclusionDiffLB) || s > x
+            }
+        }
+    }
+}
+
+object OnDemandEnumeration : SubsetEnumerationStrategy {
+    context(SearchParams) override fun prepare(I: BitSet, exclusionDiffLB: Int): ExclusionDominationTest {
+        return ExclusionDominationTest { x: Int ->
+            sequence<Int> {
+                subsetSums(params, i = 0, currSum = 0, assigned = I, bound = x)
+            }.all { s ->
+                x - s > exclusionDiffLB
+            }
+        }
+    }
+}
+
+class SortedIteration(private val chunkSize: Int) : (SearchParams, Sequence<ProposedPacking>) -> Sequence<ProposedPacking> {
+    override fun invoke(p1: SearchParams, p2: Sequence<ProposedPacking>): Sequence<ProposedPacking> {
+        return sequence<ProposedPacking> {
+            for(buffer in p2.chunked(chunkSize)) {
+                val sorted = buffer.sortedWith { a, b ->
+                    when {
+                        a.sz < b.sz -> 1
+                        a.sz > b.sz -> -1
+                        a.membership.size() != b.membership.size() -> {
+                            a.membership.size() - b.membership.size()
+                        }
+                        else -> {
+                            val lastElemA = a.membership.length() - 1
+                            val lastElemB = b.membership.length() - 1
+                            check(lastElemA >= 0 || lastElemB >= 0)
+                            p1.S[lastElemA].sz - p1.S[lastElemB].sz
+                        }
+                    }
+                }
+                yieldAll(sorted)
+            }
+        }
+    }
+
+}
+
+object EagerIteration : (SearchParams, Sequence<ProposedPacking>) -> Sequence<ProposedPacking> {
+    override fun invoke(params: SearchParams, toRet: Sequence<ProposedPacking>): Sequence<ProposedPacking> {
+        return toRet
+    }
 }
 
 context(SearchParams)
 fun generateCompletions(
     assigned: BitSet,
-    chosen: Int
-) : Sequence<List<Int>> {
-    val residue = c - S[chosen].sz
+    chosen: Int,
+    wasteFilter: (bucketWaste: Int) -> Boolean
+) : Sequence<ProposedPacking> {
+    val chosenSize = S[chosen].sz
+    val residue = c - chosenSize
     var nextItemStart = -1
     for(i in chosen + 1 ..< nElems) {
         if(!assigned.get(i)) {
@@ -203,30 +297,33 @@ fun generateCompletions(
             break
         }
     }
-    return sequence<List<Int>> {
+    return sequence<ProposedPacking> {
         feasible(
             params = params,
             assigned = assigned,
             nextItem = nextItemStart,
             excl = mutableSetOf(),
             I = BitSet(),
+            completionSize = 0,
             l = 0,
             u = residue
-        ) { I, excl ->
-            val subsetSums = sequence<Int> {
-                subsetSums(params, I, 0, 0)
-            }.toList()
-            val t = I.mapSet {
-                S[it].sz
-            }.sum()
+        ) feasibleTest@{ completionSize, I, excl ->
+            val bucketSize = chosenSize + completionSize
+            val bucketWaste = c - bucketSize
+            if(!wasteFilter(bucketWaste)) {
+                return@feasibleTest
+            }
+            val tester = enumerationStrategy.prepare(I, residue - completionSize)
             if(excl.all { x ->
-                subsetSums.all { s ->
-                    (x - s > residue - t) || s > x
-                }
+                tester.test(x)
             }) {
-                this.yield(listOf(chosen) + I.mapSet {
-                    it
-                })
+                val toYield = I.clone() as BitSet
+                toYield.set(chosen)
+                yield(ProposedPacking(
+                    sz = bucketSize,
+                    membership = toYield,
+                    waste = bucketWaste
+                ))
             }
         }
     }
@@ -236,10 +333,15 @@ context(SearchParams)
 fun List<BinItem>.waste() = c - sumOf { it.sz }
 
 context(SearchParams)
+fun BitSet.toBucket() : List<BinItem> = this.stream().mapToObj {
+    S[it]
+}.toList()
+
+context(SearchParams)
 fun searchTree(
     g: GlobalObjective,
 
-    searchStack: MutableList<List<BinItem>>,
+    searchStack: MutableList<BitSet>,
     assigned: BitSet,
     currElem: Int,
     currWaste: Int
@@ -248,7 +350,7 @@ fun searchTree(
         println("Found new solution: ${searchStack.size} vs ${g.best}")
         check(assigned.cardinality() == nElems)
         return if(searchStack.size < g.best) {
-            g.currBest = searchStack.toList()
+            g.currBest = searchStack.map { it.toBucket() }
             // we are done
             g.best == lowerBound
         } else {
@@ -261,25 +363,17 @@ fun searchTree(
     if(searchStack.size == g.best) {
         return false // have unassigned elements, can't beat our best assignment
     }
-    for(complete in generateCompletions(assigned, currElem)) {
-        val bin = complete.map {
-            S[it]
-        }
-        val binWaste = bin.waste()
-        if(currWaste + binWaste > g.W) {
-            continue
-        }
-        for(ind in complete) {
-            assigned.set(ind)
-        }
-        searchStack.add(bin)
+    for(bin in params.iterationStrategy(generateCompletions(assigned, currElem) {
+        bucketWaste -> currWaste + bucketWaste <= g.W
+    })) {
+        val binWaste = bin.waste
+        assigned.or(bin.membership)
+        searchStack.add(bin.membership)
         if(searchTree(g, searchStack, assigned, currElem + 1, currWaste + binWaste)) {
             return true
         }
         searchStack.removeLast()
-        for(ind in complete) {
-            assigned.clear(ind)
-        }
+        assigned.andNot(bin.membership)
     }
     return false
 }
@@ -306,18 +400,6 @@ fun bfd(l: List<BinItem>, c: Int) : List<List<BinItem>> {
     }
     return bins.map {
         it.elems
-    }
-}
-
-fun l1(l: List<BinItem>, c: Int)  : Int {
-    val totalSize = l.sumOf {
-        it.sz
-    }
-    val div = totalSize / c
-    return if(div % c == 0) {
-        c
-    } else {
-        c + 1
     }
 }
 
@@ -397,8 +479,6 @@ fun main(args: Array<String>) {
     }!!, decimalPlaces(binSize))
 
     val scaleAmount = (10.0).pow(maxPrecision.toDouble()).toInt()
-    println(scaleAmount)
-    println(maxPrecision)
 
     val c = (binSize.toFloat() * scaleAmount).toInt()
     val bins = rawNodes.map {
@@ -414,7 +494,9 @@ fun main(args: Array<String>) {
         c = c,
         S = bins,
         lowerBound = lowerBound,
-        sumS = bins.sumOf { it.sz }
+        sumS = bins.sumOf { it.sz },
+        iterationStrategy = SortedIteration(7),
+        enumerationStrategy = UpfrontEnumeration
     )
     val obj = GlobalObjective(
         currBest = naive
