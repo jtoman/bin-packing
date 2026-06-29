@@ -185,10 +185,10 @@ suspend fun SequenceScope<Int>.subsetSums(
         return
     }
     subsetSums(
-        params, assigned, tgt + 1, currSum
+        params, assigned, tgt + 1, currSum, pred
     )
     subsetSums(
-        params, assigned, tgt + 1, params.S[tgt].sz + currSum
+        params, assigned, tgt + 1, params.S[tgt].sz + currSum, pred
     )
 }
 
@@ -241,7 +241,7 @@ object UpfrontEnumeration : SubsetEnumerationStrategy {
 object OnDemandEnumeration : SubsetEnumerationStrategy {
     context(SearchParams) override fun prepare(I: BitSet, exclusionDiffLB: Int): ExclusionDominationTest {
         return ExclusionDominationTest { x: Int ->
-            sequence<Int> {
+            sequence {
                 subsetSums(params, i = 0, currSum = 0, assigned = I, bound = x)
             }.all { s ->
                 x - s > exclusionDiffLB
@@ -252,7 +252,7 @@ object OnDemandEnumeration : SubsetEnumerationStrategy {
 
 class SortedIteration(private val chunkSize: Int) : (SearchParams, Sequence<ProposedPacking>) -> Sequence<ProposedPacking> {
     override fun invoke(p1: SearchParams, p2: Sequence<ProposedPacking>): Sequence<ProposedPacking> {
-        return sequence<ProposedPacking> {
+        return sequence {
             for(buffer in p2.chunked(chunkSize)) {
                 val sorted = buffer.sortedWith { a, b ->
                     when {
@@ -314,9 +314,8 @@ fun generateCompletions(
                 return@feasibleTest
             }
             val tester = enumerationStrategy.prepare(I, residue - completionSize)
-            if(excl.all { x ->
-                tester.test(x)
-            }) {
+            val failingExcl = excl.filterNot { x -> tester.test(x) }
+            if(failingExcl.isEmpty()) {
                 val toYield = I.clone() as BitSet
                 toYield.set(chosen)
                 yield(ProposedPacking(
