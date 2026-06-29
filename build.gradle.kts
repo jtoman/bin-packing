@@ -35,6 +35,7 @@ kotlin {
 dependencies {
     testImplementation(kotlin("test"))
     implementation("org.yaml:snakeyaml:2.6")
+    implementation("com.github.ajalt.clikt:clikt:5.0.1")
 }
 
 tasks.test {
@@ -42,5 +43,5 @@ tasks.test {
 }
 
 application {
-    mainClass.set("MainKt")
+    mainClass.set("com.github.jtoman.MainKt")
 }

@@ -1,3 +1,18 @@
+package com.github.jtoman
+
+import com.github.ajalt.clikt.core.CliktCommand
+import com.github.ajalt.clikt.core.main
+import com.github.ajalt.clikt.parameters.arguments.argument
+import com.github.ajalt.clikt.parameters.groups.OptionGroup
+import com.github.ajalt.clikt.parameters.groups.defaultByName
+import com.github.ajalt.clikt.parameters.groups.groupChoice
+import com.github.ajalt.clikt.parameters.options.default
+import com.github.ajalt.clikt.parameters.options.option
+import com.github.ajalt.clikt.parameters.options.required
+import com.github.ajalt.clikt.parameters.types.choice
+import com.github.ajalt.clikt.parameters.types.file
+import com.github.ajalt.clikt.parameters.types.inputStream
+import com.github.ajalt.clikt.parameters.types.int
 import org.yaml.snakeyaml.Yaml
 import java.io.File
 import java.lang.IllegalStateException
@@ -225,6 +240,8 @@ interface SubsetEnumerationStrategy {
     ): ExclusionDominationTest
 }
 
+typealias IterationStrategy = SearchParams.(Sequence<ProposedPacking>) -> Sequence<ProposedPacking>
+
 object UpfrontEnumeration : SubsetEnumerationStrategy {
     context(SearchParams) override fun prepare(I: BitSet, exclusionDiffLB: Int): ExclusionDominationTest {
         val subsetSums = sequence<Int> {
@@ -318,11 +335,13 @@ fun generateCompletions(
             if(failingExcl.isEmpty()) {
                 val toYield = I.clone() as BitSet
                 toYield.set(chosen)
-                yield(ProposedPacking(
+                yield(
+                    ProposedPacking(
                     sz = bucketSize,
                     membership = toYield,
                     waste = bucketWaste
-                ))
+                )
+                )
             }
         }
     }
@@ -457,64 +476,98 @@ fun decimalPlaces(
     return x[1].trimEnd('0').length
 }
 
+sealed class IterationStratOption(name: String) : OptionGroup(name) {
+    abstract val backend: IterationStrategy
+}
+class EagerIterationOption : IterationStratOption("Eager Iteration") {
+    override val backend: IterationStrategy
+        get() = EagerIteration
+}
+
+class ChunkedIteration : IterationStratOption("Buffered Iteration") {
+    val bufferSize by option().int().default(5)
+    override val backend: IterationStrategy
+        get() = SortedIteration(bufferSize)
+}
+
+class BinPacker : CliktCommand() {
+    private val subsetStrategy by option("--subset-strat").choice(
+        "ondemand" to OnDemandEnumeration,
+        "upfront" to UpfrontEnumeration
+    ).default(UpfrontEnumeration)
+
+    private val iterationStrategy by option("--iteration-strat").groupChoice(
+        "chunked" to ChunkedIteration(),
+        "eager" to EagerIterationOption()
+    ).defaultByName("chunked")
+
+    private val inputFile by argument("input").file(mustExist = true, mustBeReadable = true)
+    private val binSize by argument("c")
+
+    override fun run() {
+        val node = inputFile.reader().use {
+            Yaml().load<List<Map<String, Any?>>>(it)
+        }
+        val rawNodes = mutableListOf<Pair<String, Float>>()
+        for((i, n) in node.withIndex()) {
+            if("name" !in n || n["name"] !is String) {
+                throw IllegalStateException("Missing or malformed 'name' field in entry $i")
+            }
+            if("scale" !in n || (n["scale"] !is Number)) {
+                throw IllegalStateException("Missing or malformed 'scale' field in entry $i")
+            }
+            val scale = (n["scale"] as Number).toFloat()
+            rawNodes.add((n["name"] as String) to scale)
+        }
+        val maxPrecision = max(rawNodes.maxOfOrNull {
+            decimalPlaces(it.second)
+        }!!, decimalPlaces(binSize))
+
+        val scaleAmount = (10.0).pow(maxPrecision.toDouble()).toInt()
+
+        val c = (binSize.toFloat() * scaleAmount).toInt()
+        val bins = rawNodes.map {
+            BinItem(
+                it.first, (it.second * scaleAmount).toInt()
+            )
+        }.sortedByDescending { it.sz }
+
+        val naive = bfd(bins, c)
+        check(naive.flatten().toSet() == bins.toSet())
+        val lowerBound = l2(bins, c)
+        val params = SearchParams(
+            c = c,
+            S = bins,
+            lowerBound = lowerBound,
+            sumS = bins.sumOf { it.sz },
+            iterationStrategy = iterationStrategy.backend,
+            enumerationStrategy = subsetStrategy
+        )
+        val obj = GlobalObjective(
+            currBest = naive
+        )
+        val found = with(params) {
+            searchTree(
+                g = obj,
+                assigned = BitSet(),
+                currElem = 0,
+                currWaste = 0,
+                searchStack = mutableListOf()
+            )
+        }
+        println("Found optimal: $found")
+        for(i in obj.currBest) {
+            val w = with(params) {
+                i.waste()
+            }.toDouble() / scaleAmount
+            println("Bucket: $i (waste: $w)")
+        }
+
+    }
+
+}
+
+
 fun main(args: Array<String>) {
-    val node = File(args[0]).reader().use {
-        Yaml().load<List<Map<String, Any?>>>(it)
-    }
-    val rawNodes = mutableListOf<Pair<String, Float>>()
-    for((i, n) in node.withIndex()) {
-        if("name" !in n || n["name"] !is String) {
-            throw IllegalStateException("Missing or malformed 'name' field in entry $i")
-        }
-        if("scale" !in n || (n["scale"] !is Number)) {
-            throw IllegalStateException("Missing or malformed 'scale' field in entry $i")
-        }
-        val scale = (n["scale"] as Number).toFloat()
-        rawNodes.add((n["name"] as String) to scale)
-    }
-    val binSize = args[1]
-    val maxPrecision = max(rawNodes.maxOfOrNull {
-        decimalPlaces(it.second)
-    }!!, decimalPlaces(binSize))
-
-    val scaleAmount = (10.0).pow(maxPrecision.toDouble()).toInt()
-
-    val c = (binSize.toFloat() * scaleAmount).toInt()
-    val bins = rawNodes.map {
-        BinItem(
-            it.first, (it.second * scaleAmount).toInt()
-        )
-    }.sortedByDescending { it.sz }
-
-    val naive = bfd(bins, c)
-    check(naive.flatten().toSet() == bins.toSet())
-    val lowerBound = l2(bins, c)
-    val params = SearchParams(
-        c = c,
-        S = bins,
-        lowerBound = lowerBound,
-        sumS = bins.sumOf { it.sz },
-        iterationStrategy = SortedIteration(7),
-        enumerationStrategy = UpfrontEnumeration
-    )
-    val obj = GlobalObjective(
-        currBest = naive
-    )
-    val found = with(params) {
-        searchTree(
-            g = obj,
-            assigned = BitSet(),
-            currElem = 0,
-            currWaste = 0,
-            searchStack = mutableListOf()
-        )
-    }
-    println("Found optimal: $found")
-    println(obj.currBest.size)
-    for(i in obj.currBest) {
-        val w = with(params) {
-            i.waste()
-        }.toDouble() / scaleAmount
-        println("Bucket: $i (waste: $w)")
-    }
+    BinPacker().main(args)
 }
